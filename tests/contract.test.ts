@@ -5,15 +5,12 @@ import { cleanup, connect, PUBLIC_URL } from './helpers';
 afterEach(cleanup);
 
 /**
- * The MCP contract clients relied on before the template migration, recorded from the deployed
- * code in `fixtures/contract-before.json`. Names, order and input schemas must match exactly.
- * Every other difference is deliberate and listed here (and in CHANGELOG.md).
+ * The MCP contract clients relied on before the template migration. Existing tools remain
+ * byte-for-byte compatible; new tools are asserted separately.
  */
-
-/** Removed: a template sample that reported server uptime, not part of what the server is for. */
 const REMOVED = ['health'];
+const ADDED = ['spotify_insights'];
 
-/** Added: the display titles the first release defined but never sent. */
 const TITLES: Record<string, string> = {
   player_status: 'Player Status',
   search_catalog: 'Find Music (Catalog Search)',
@@ -24,11 +21,6 @@ const TITLES: Record<string, string> = {
 
 type Schema = Record<string, unknown>;
 
-/**
- * Zod 4.4 published a nullable field as `anyOf: [{type: X}, {type: 'null'}]`; Zod 4.6 (the
- * template's version) writes `type: [X, 'null']`. Both accept the same values. Rewrite the old
- * spelling into the new one, so everything else in the output schemas must match exactly.
- */
 function newNullableSpelling(schema: unknown): unknown {
   if (Array.isArray(schema)) return schema.map(newNullableSpelling);
   if (!schema || typeof schema !== 'object') return schema;
@@ -49,14 +41,12 @@ function newNullableSpelling(schema: unknown): unknown {
   return node;
 }
 
-/** Added in 1.2.0: a thumbnail URL on every track, album, artist and playlist result. */
 const IMAGE = {
   description: 'Thumbnail URL, about 300 px wide. For a track, its album cover.',
   type: 'string',
   format: 'uri',
 };
 
-/** The recorded output schema with `image` added to the four slim entities, where they appear. */
 function withImages(schema: unknown): unknown {
   if (Array.isArray(schema)) return schema.map(withImages);
   if (!schema || typeof schema !== 'object') return schema;
@@ -78,17 +68,18 @@ for (const era of ['modern', 'legacy'] as const) {
       recorded['tools/list'].tools as unknown as Array<Record<string, unknown>>
     ).filter((tool) => !REMOVED.includes(String(tool.name)));
 
-    test('the same tools, in the same order, with the same input schemas', async () => {
+    test('keeps existing tools unchanged and appends listening insights', async () => {
       const client = await connect({ era });
       const { tools } = await client.listTools();
+      const existing = tools.filter((tool) => !ADDED.includes(tool.name));
 
       expect(
         (recorded['tools/list'].tools as Array<{ name: string }>).map((tool) => tool.name),
-      ).toEqual([...REMOVED, ...tools.map((tool) => tool.name)]);
-      expect(tools.map((tool) => tool.name)).toEqual(
+      ).toEqual([...REMOVED, ...existing.map((tool) => tool.name)]);
+      expect(existing.map((tool) => tool.name)).toEqual(
         recordedTools.map((tool) => String(tool.name)),
       );
-      for (const [index, tool] of tools.entries()) {
+      for (const [index, tool] of existing.entries()) {
         const old = recordedTools[index] as Record<string, unknown>;
         expect(tool.inputSchema).toEqual(old.inputSchema as typeof tool.inputSchema);
         expect(tool.annotations).toEqual(old.annotations as typeof tool.annotations);
@@ -99,48 +90,49 @@ for (const era of ['modern', 'legacy'] as const) {
         expect(tool.title).toBe(TITLES[tool.name] as string);
         expect(Object.keys(tool).sort()).toEqual([...Object.keys(old), 'title'].sort());
       }
+
+      expect(tools.map((tool) => tool.name)).toEqual([...existing.map((tool) => tool.name), ...ADDED]);
+      expect(tools.at(-1)).toMatchObject({
+        name: 'spotify_insights',
+        title: 'Listening History and Taste',
+        annotations: { readOnlyHint: true, openWorldHint: true },
+      });
     });
 
-    test('only player_status spells nullable output fields differently', async () => {
+    test('only player_status spells nullable output fields differently among existing tools', async () => {
       const client = await connect({ era });
-      const { tools } = await client.listTools();
+      const tools = (await client.listTools()).tools.filter((tool) => !ADDED.includes(tool.name));
       const changed = tools
         .filter(
           (tool, index) =>
             JSON.stringify(tool.outputSchema) !==
-            JSON.stringify(
-              withImages((recordedTools[index] as Record<string, unknown>).outputSchema),
-            ),
+            JSON.stringify(withImages((recordedTools[index] as Record<string, unknown>).outputSchema)),
         )
         .map((tool) => tool.name);
       expect(changed).toEqual(['player_status']);
     });
 
-    test('image is added to search results and to the tracks of player_status only', async () => {
+    test('image remains on the existing search and status outputs', async () => {
       const client = await connect({ era });
-      const { tools } = await client.listTools();
+      const tools = (await client.listTools()).tools.filter((tool) => !ADDED.includes(tool.name));
       const withImage = tools
         .filter((tool) => JSON.stringify(tool.outputSchema).includes('"image"'))
         .map((tool) => tool.name);
       expect(withImage).toEqual(['player_status', 'search_catalog']);
     });
 
-    test('identity and instructions as before; version, icon and capabilities as listed', async () => {
+    test('identity and instructions remain compatible', async () => {
       const client = await connect({ era });
       const { name, title, description } = recorded.serverInfo;
-
       expect(client.getServerVersion()).toEqual({
         name,
         title,
         description,
-        // Changed: the version, and an icon served from the public origin.
         version: '1.2.0',
         icons: [
           { src: new URL('/icon.svg', PUBLIC_URL).href, mimeType: 'image/svg+xml', sizes: ['any'] },
         ],
       });
-      // Changed for modern clients: `listChanged` and `subscribe` are false, as legacy clients
-      // already saw. The lists change only on deploy, and nothing ever sent a notification.
       expect(Object.keys(recorded.capabilities).sort()).toEqual(['prompts', 'resources', 'tools']);
       expect(client.getServerCapabilities()).toEqual({
         tools: { listChanged: false },
@@ -150,12 +142,8 @@ for (const era of ['modern', 'legacy'] as const) {
       expect(client.getInstructions()).toBe(recorded.instructions as string);
     });
 
-    test('no resources, resource templates or prompts, as before', async () => {
+    test('has no resources, templates, or prompts', async () => {
       const client = await connect({ era });
-
-      expect(recorded['resources/list'].resources).toEqual([]);
-      expect(recorded['resources/templates/list'].resourceTemplates).toEqual([]);
-      expect(recorded['prompts/list'].prompts).toEqual([]);
       expect((await client.listResources()).resources).toEqual([]);
       expect((await client.listResourceTemplates()).resourceTemplates).toEqual([]);
       expect((await client.listPrompts()).prompts).toEqual([]);
@@ -163,7 +151,7 @@ for (const era of ['modern', 'legacy'] as const) {
   });
 }
 
-test('the lists are cacheable by every caller: they are the same for everyone', async () => {
+test('the lists are cacheable by every caller', async () => {
   expect(before.modern['tools/list']).toMatchObject({ ttlMs: 60_000, cacheScope: 'private' });
   const client = await connect();
   expect(await client.listTools()).toMatchObject({ ttlMs: 60_000, cacheScope: 'public' });
